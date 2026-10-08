@@ -1,0 +1,21 @@
+apiVersion: fluxcd.controlplane.io/v1
+kind: ResourceSetInputProvider
+metadata:
+  name: {{ include "preview.name" . }}
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    fluxcd.controlplane.io/reconcileEvery: {{ .Values.repository.pollInterval | quote }}
+    fluxcd.controlplane.io/reconcileTimeout: "2m"
+spec:
+  type: GitHubBranch
+  url: {{ include "preview.url" . | quote }}
+  {{- if .Values.repository.credentialsSecret }}
+  secretRef:
+    name: {{ .Values.repository.credentialsSecret }}
+  {{- end }}
+  filter:
+    includeBranch: {{ .Values.repository.includeBranch | quote }}
+    {{- if .Values.repository.excludeBranch }}
+    excludeBranch: {{ .Values.repository.excludeBranch | quote }}
+    {{- end }}
+    limit: {{ .Values.repository.branchLimit }}

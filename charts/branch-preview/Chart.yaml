@@ -1,0 +1,7 @@
+apiVersion: v2
+name: branch-preview
+description: GitHub branch previews with Flux Operator, BuildKit, GHCR, Gateway API and CloudNativePG.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.33.0-0"

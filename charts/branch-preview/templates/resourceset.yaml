@@ -1,0 +1,333 @@
+{{- $name := include "preview.name" . -}}
+{{- $buildID := include "preview.buildID" . -}}
+{{- $image := include "preview.image" . -}}
+apiVersion: fluxcd.controlplane.io/v1
+kind: ResourceSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    fluxcd.controlplane.io/reconcileEvery: "30s"
+    fluxcd.controlplane.io/reconcileTimeout: "2m"
+spec:
+  serviceAccountName: {{ $name }}-reconciler
+  # Do not wait on builds/rollouts: a failing branch must not block new input events.
+  wait: false
+  inputsFrom:
+    - kind: ResourceSetInputProvider
+      name: {{ $name }}
+  commonMetadata:
+    labels:
+      app.kubernetes.io/part-of: branch-preview
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+  resourcesTemplate: |
+    <<- $id := inputs.branch | sha256sum | trunc 16 ->>
+    <<- $name := printf "{{ $name }}-%s" $id ->>
+    <<- $dns := inputs.branch ->>
+    <<- if or (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $dns)) (gt (len $dns) 63) (contains "--" $dns) ->>
+    <<- $slug := regexReplaceAll "[^a-z0-9-]+" (lower inputs.branch) "-" | trimAll "-" | trunc 45 | trimSuffix "-" | default "branch" ->>
+    <<- $dns = printf "%s--%s" $slug $id ->>
+    <<- end ->>
+    <<- $tag := printf "sha-%s-%s-{{ $buildID }}" inputs.sha $id ->>
+    <<- $jobID := printf "%s:{{ $buildID }}" inputs.sha | sha256sum | trunc 20 ->>
+    apiVersion: coordination.k8s.io/v1
+    kind: Lease
+    metadata:
+      name: << $name >>-publish
+      namespace: {{ .Release.Namespace }}
+      annotations:
+        # Never prune this mutex: a deleted/recreated branch must not bypass a holder.
+        fluxcd.controlplane.io/prune: disabled
+        elektrokube.dev/branch: << inputs.branch | toJson >>
+    # Intentionally no spec: only the publisher owns holderIdentity/resourceVersion.
+    ---
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: << $name >>-builder
+      namespace: {{ .Release.Namespace }}
+    automountServiceAccountToken: false
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: << $name >>-builder
+      namespace: {{ .Release.Namespace }}
+    rules:
+      - apiGroups: [coordination.k8s.io]
+        resources: [leases]
+        resourceNames: [<< $name >>-publish]
+        verbs: [get, update]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: << $name >>-builder
+      namespace: {{ .Release.Namespace }}
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: << $name >>-builder
+    subjects:
+      - kind: ServiceAccount
+        name: << $name >>-builder
+        namespace: {{ .Release.Namespace }}
+    ---
+    apiVersion: postgresql.cnpg.io/v1
+    kind: Cluster
+    metadata:
+      name: << $name >>-db
+      namespace: {{ .Release.Namespace }}
+      annotations:
+        elektrokube.dev/branch: << inputs.branch | toJson >>
+        {{- if .Values.database.retainOnDelete }}
+        fluxcd.controlplane.io/prune: disabled
+        {{- end }}
+    spec:
+      instances: {{ .Values.database.instances }}
+      enableSuperuserAccess: false
+      {{- if .Values.database.imageName }}
+      imageName: {{ .Values.database.imageName | quote }}
+      {{- end }}
+      bootstrap:
+        initdb:
+          database: {{ .Values.database.name | quote }}
+          owner: {{ .Values.database.owner | quote }}
+      storage:
+        size: {{ .Values.database.size | quote }}
+        storageClass: {{ .Values.database.storageClass | quote }}
+      resources:
+{{ toYaml .Values.database.resources | indent 8 }}
+    ---
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: << $name >>-<< $jobID >>
+      namespace: {{ .Release.Namespace }}
+      labels:
+        elektrokube.dev/branch-id: << $id | toJson >>
+      annotations:
+        elektrokube.dev/branch: << inputs.branch | toJson >>
+        elektrokube.dev/commit: << inputs.sha | toJson >>
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: {{ .Values.build.timeoutSeconds }}
+      # No TTL: removing a completed desired Job would cause Flux to build it again.
+      template:
+        metadata:
+          labels:
+            elektrokube.dev/branch-id: << $id | toJson >>
+            elektrokube.dev/component: builder
+        spec:
+          restartPolicy: Never
+          serviceAccountName: << $name >>-builder
+          automountServiceAccountToken: false
+          terminationGracePeriodSeconds: 180
+          securityContext:
+            fsGroup: 1000
+          {{- if .Values.registry.pullSecret }}
+          imagePullSecrets:
+            - name: {{ .Values.registry.pullSecret }}
+          {{- end }}
+          nodeSelector:
+{{ toYaml .Values.build.nodeSelector | indent 12 }}
+          tolerations:
+{{ toYaml .Values.build.tolerations | indent 12 }}
+          initContainers:
+            # Native sidecar: Kubernetes stops it when the runner finishes.
+            - name: buildkit
+              restartPolicy: Always
+              image: {{ .Values.build.buildkitImage | quote }}
+              args:
+                - --addr=unix:///run/buildkit/buildkitd.sock
+                - --oci-worker-no-process-sandbox
+                - --oci-worker-snapshotter=native
+              securityContext:
+                runAsUser: 1000
+                runAsGroup: 1000
+                # RootlessKit's uid/gid mapping helpers require setuid support.
+                allowPrivilegeEscalation: true
+                seccompProfile: {type: Unconfined}
+                appArmorProfile: {type: Unconfined}
+              startupProbe:
+                exec:
+                  command: [buildctl, --addr, unix:///run/buildkit/buildkitd.sock, debug, workers]
+                periodSeconds: 2
+                failureThreshold: 60
+              resources:
+{{ toYaml .Values.build.resources | indent 16 }}
+              volumeMounts:
+                - {name: socket, mountPath: /run/buildkit}
+                - {name: cache, mountPath: /home/user/.local/share/buildkit}
+          containers:
+            - name: runner
+              image: {{ .Values.build.toolsImage | quote }}
+              imagePullPolicy: Always
+              command: [python, /runner/runner.py]
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 1000
+                runAsGroup: 1000
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+                seccompProfile: {type: RuntimeDefault}
+              resources:
+                requests: {cpu: 100m, memory: 128Mi}
+                limits: {cpu: "1", memory: 512Mi}
+              env:
+                - {name: REPOSITORY, value: {{ include "preview.repo" . | quote }}}
+                - {name: BRANCH, value: << inputs.branch | toJson >>}
+                - {name: COMMIT_SHA, value: << inputs.sha | toJson >>}
+                - {name: IMAGE, value: {{ $image | quote }}}
+                - {name: COMMIT_TAG, value: << $tag | toJson >>}
+                - {name: BRANCH_TAG, value: "branch-<< $dns >>"}
+                - {name: LEASE_NAME, value: "<< $name >>-publish"}
+                - {name: DOCKER_CONFIG, value: /docker}
+                - {name: BUILD_CONTEXT, value: {{ .Values.build.context | quote }}}
+                - {name: DOCKERFILE, value: {{ .Values.build.dockerfile | quote }}}
+                - {name: BUILD_PLATFORM, value: {{ .Values.build.platform | quote }}}
+                - {name: BUILD_TARGET, value: {{ .Values.build.target | quote }}}
+                - {name: BUILD_ARGS, value: {{ toJson .Values.build.args | quote }}}
+                - {name: CHECK_INTERVAL, value: {{ .Values.build.checkIntervalSeconds | quote }}}
+                - {name: LOCK_WAIT, value: {{ .Values.build.lockWaitSeconds | quote }}}
+                - name: POD_UID
+                  valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+                - name: POD_NAMESPACE
+                  valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+              volumeMounts:
+                - {name: runner, mountPath: /runner, readOnly: true}
+                - {name: workspace, mountPath: /workspace}
+                - {name: tmp, mountPath: /tmp}
+                - {name: socket, mountPath: /run/buildkit}
+                - {name: docker, mountPath: /docker, readOnly: true}
+                - {name: kube, mountPath: /kube, readOnly: true}
+                {{- if .Values.repository.credentialsSecret }}
+                - {name: github, mountPath: /github, readOnly: true}
+                {{- end }}
+          volumes:
+            - name: runner
+              configMap:
+                name: {{ $name }}-runner-{{ $buildID }}
+            - name: workspace
+              emptyDir: {sizeLimit: {{ .Values.build.workspaceSize | quote }}}
+            - name: cache
+              emptyDir: {sizeLimit: {{ .Values.build.cacheSize | quote }}}
+            - name: tmp
+              emptyDir: {sizeLimit: 100Mi}
+            - name: socket
+              emptyDir: {}
+            - name: docker
+              secret:
+                secretName: {{ .Values.registry.pushSecret }}
+                items: [{key: .dockerconfigjson, path: config.json}]
+            {{- if .Values.repository.credentialsSecret }}
+            - name: github
+              secret:
+                secretName: {{ .Values.repository.credentialsSecret }}
+                items: [{key: password, path: password}]
+            {{- end }}
+            - name: kube
+              projected:
+                sources:
+                  - serviceAccountToken: {path: token, expirationSeconds: 3600}
+                  - configMap:
+                      name: kube-root-ca.crt
+                      items: [{key: ca.crt, path: ca.crt}]
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: << $name >>
+      namespace: {{ .Release.Namespace }}
+      annotations:
+        elektrokube.dev/branch: << inputs.branch | toJson >>
+    spec:
+      replicas: {{ .Values.application.replicas }}
+      revisionHistoryLimit: 2
+      progressDeadlineSeconds: {{ add .Values.build.timeoutSeconds 600 }}
+      strategy:
+        type: RollingUpdate
+        rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+      selector:
+        matchLabels:
+          elektrokube.dev/application: << $name >>
+      template:
+        metadata:
+          labels:
+            elektrokube.dev/application: << $name >>
+          annotations:
+            elektrokube.dev/commit: << inputs.sha | toJson >>
+        spec:
+          automountServiceAccountToken: false
+          {{- if .Values.registry.pullSecret }}
+          imagePullSecrets:
+            - name: {{ .Values.registry.pullSecret }}
+          {{- end }}
+          nodeSelector:
+{{ toYaml .Values.application.nodeSelector | indent 12 }}
+          tolerations:
+{{ toYaml .Values.application.tolerations | indent 12 }}
+          containers:
+            - name: app
+              # New commits change the pod template. Never deploy an unversioned branch tag.
+              image: "{{ $image }}:<< $tag >>"
+              imagePullPolicy: Always
+              ports:
+                - {name: http, containerPort: {{ .Values.application.port }}}
+              {{- if .Values.application.command }}
+              command:
+{{ toYaml .Values.application.command | indent 16 }}
+              {{- end }}
+              {{- if .Values.application.args }}
+              args:
+{{ toYaml .Values.application.args | indent 16 }}
+              {{- end }}
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef: {name: "<< $name >>-db-app", key: uri}
+                {{- with .Values.application.env }}
+{{ toYaml . | indent 16 }}
+                {{- end }}
+              envFrom:
+{{ toYaml .Values.application.envFrom | indent 16 }}
+              readinessProbe:
+{{ toYaml .Values.application.readinessProbe | indent 16 }}
+              startupProbe:
+{{ toYaml .Values.application.startupProbe | indent 16 }}
+              securityContext:
+{{ toYaml .Values.application.securityContext | indent 16 }}
+              resources:
+{{ toYaml .Values.application.resources | indent 16 }}
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: << $name >>
+      namespace: {{ .Release.Namespace }}
+    spec:
+      selector:
+        elektrokube.dev/application: << $name >>
+      ports:
+        - {name: http, port: {{ .Values.application.port }}, targetPort: http}
+    ---
+    apiVersion: gateway.networking.k8s.io/v1
+    kind: HTTPRoute
+    metadata:
+      name: << $name >>
+      namespace: {{ .Release.Namespace }}
+      annotations:
+        elektrokube.dev/branch: << inputs.branch | toJson >>
+    spec:
+      parentRefs:
+        - name: {{ .Values.routing.gateway.name }}
+          namespace: {{ .Values.routing.gateway.namespace }}
+          sectionName: {{ .Values.routing.gateway.sectionName }}
+      hostnames:
+        - "<< $dns >>.{{ include "preview.repoLabel" . }}.{{ .Values.routing.domain }}"
+      rules:
+        - matches:
+            - path: {type: PathPrefix, value: /}
+          backendRefs:
+            - {name: "<< $name >>", port: {{ .Values.application.port }}}

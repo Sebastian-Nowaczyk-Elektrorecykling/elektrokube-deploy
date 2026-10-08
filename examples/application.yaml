@@ -1,0 +1,43 @@
+# Copy to applications/<app>.yaml and replace YOUR-APP and preview-my-app.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: preview-my-app
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
+  labels:
+    # Rootless BuildKit requires unconfined seccomp/AppArmor and setuid helpers.
+    # This is a dedicated trusted-build namespace, not an untrusted-tenant sandbox.
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: my-app
+  namespace: preview-my-app
+spec:
+  interval: 5m
+  timeout: 5m
+  chart:
+    spec:
+      chart: ./charts/branch-preview
+      reconcileStrategy: Revision
+      sourceRef:
+        kind: GitRepository
+        name: elektrokube-deploy
+        namespace: flux-system
+      interval: 1m
+  install:
+    remediation: {retries: 3}
+  upgrade:
+    remediation: {retries: 3}
+  values:
+    repository:
+      url: https://github.com/Sebastian-Nowaczyk-Elektrorecykling/YOUR-APP
+      credentialsSecret: github-auth
+    application:
+      port: 8080
+    database:
+      storageClass: longhorn-cnpg
+      size: 5Gi
+      retainOnDelete: true

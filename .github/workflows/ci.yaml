@@ -1,0 +1,85 @@
+name: Validate and publish build tools
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install test dependencies and pinned CLIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -r tests/requirements.txt
+          mkdir -p "$RUNNER_TEMP/tools"
+          cd "$RUNNER_TEMP/tools"
+          curl -fsSLO --retry 3 https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz
+          curl -fsSLO --retry 3 https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz.sha256sum
+          sha256sum --check helm-v3.19.0-linux-amd64.tar.gz.sha256sum
+          tar -xzf helm-v3.19.0-linux-amd64.tar.gz linux-amd64/helm
+          sudo install linux-amd64/helm /usr/local/bin/helm
+          base=https://github.com/controlplaneio-fluxcd/flux-operator/releases/download/v0.61.0
+          curl -fsSLO --retry 3 "$base/flux-operator_0.61.0_linux_amd64.tar.gz"
+          curl -fsSLO --retry 3 "$base/flux-operator_0.61.0_checksums.txt"
+          grep ' flux-operator_0.61.0_linux_amd64.tar.gz$' flux-operator_0.61.0_checksums.txt | sha256sum --check
+          tar -xzf flux-operator_0.61.0_linux_amd64.tar.gz flux-operator
+          sudo install flux-operator /usr/local/bin/flux-operator
+      - run: make test
+      - name: Validate GitOps roots and package chart
+        run: |
+          kubectl kustomize bootstrap >/dev/null
+          kubectl kustomize clusters/elektrokube >/dev/null
+          kubectl kustomize infrastructure/flux-operator >/dev/null
+          kubectl kustomize infrastructure/gateway >/dev/null
+          kubectl kustomize applications >/dev/null
+          helm package charts/branch-preview --destination .dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: branch-preview-chart
+          path: .dist/*.tgz
+  publish:
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image coordinates
+        id: image
+        shell: bash
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}/build-tools" >> "$GITHUB_OUTPUT"
+          echo "version=$(sed -n 's/^appVersion: "\(.*\)"/\1/p' charts/branch-preview/Chart.yaml)" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build-tools/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ steps.image.outputs.version }}
+            ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

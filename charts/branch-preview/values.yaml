@@ -1,0 +1,76 @@
+# Install one release per source repository / destination image, in a dedicated namespace.
+repository:
+  url: "" # Required: https://github.com/OWNER/REPO
+  credentialsSecret: github-auth # basic-auth Secret: username and password (read-only PAT)
+  pollInterval: 30s
+  includeBranch: ".*"
+  excludeBranch: ""
+  # Flux's API has a hard ceiling of 10,000. Avoid its default limit of 100.
+  branchLimit: 10000
+registry:
+  image: "" # Defaults to ghcr.io/<lowercase-owner>/<lowercase-repository>
+  pushSecret: ghcr-push # kubernetes.io/dockerconfigjson, write:packages
+  pullSecret: ghcr-pull # kubernetes.io/dockerconfigjson, read:packages
+build:
+  toolsImage: ghcr.io/sebastian-nowaczyk-elektrorecykling/elektrokube-deploy/build-tools:0.1.0
+  buildkitImage: moby/buildkit:v0.32.2-rootless
+  context: .
+  dockerfile: Dockerfile # Relative to repository root, not context.
+  target: ""
+  platform: linux/amd64
+  args: {} # Non-secret Dockerfile build arguments only.
+  revision: "1" # Bump to rebuild the same commit (e.g. updated base images).
+  checkIntervalSeconds: 10
+  timeoutSeconds: 1800
+  lockWaitSeconds: 300
+  nodeSelector:
+    kubernetes.io/arch: amd64
+  tolerations: []
+  resources:
+    requests: {cpu: 500m, memory: 512Mi, ephemeral-storage: 2Gi}
+    limits: {cpu: "2", memory: 4Gi, ephemeral-storage: 20Gi}
+  workspaceSize: 5Gi
+  cacheSize: 10Gi
+application:
+  replicas: 1
+  port: 8080
+  env: [] # Kubernetes EnvVar objects; DATABASE_URL is provided automatically.
+  envFrom: []
+  command: []
+  args: []
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: "1", memory: 512Mi}
+  # Override with HTTP probes when the application provides a health endpoint.
+  readinessProbe:
+    tcpSocket: {port: http}
+    periodSeconds: 5
+  startupProbe:
+    tcpSocket: {port: http}
+    periodSeconds: 5
+    failureThreshold: 60
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities: {drop: [ALL]}
+    seccompProfile: {type: RuntimeDefault}
+  nodeSelector:
+    kubernetes.io/arch: amd64
+  tolerations: []
+routing:
+  domain: test.internal
+  repositoryLabel: "" # Defaults to the normalized repository name.
+  gateway:
+    name: test-internal
+    namespace: gateway-system
+    sectionName: http
+database:
+  instances: 1
+  name: app
+  owner: app
+  imageName: "" # Empty lets the installed CNPG operator choose its supported default.
+  storageClass: longhorn-cnpg
+  size: 5Gi
+  retainOnDelete: true
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}

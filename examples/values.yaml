@@ -1,0 +1,6 @@
+repository:
+  url: https://github.com/Sebastian-Nowaczyk-Elektrorecykling/YOUR-APP
+application:
+  port: 8080
+# Private registry images use ghcr-pull. The builder uses the distinct ghcr-push Secret.
+# For a public GitHub repository, credentialsSecret may be empty (lower API rate limit).
