@@ -48,6 +48,8 @@ jobs:
         with:
           name: branch-preview-chart
           path: .dist/*.tgz
+          include-hidden-files: true
+          if-no-files-found: error
   publish:
     needs: validate
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
